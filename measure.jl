@@ -1,52 +1,69 @@
-using LinearAlgebra
-using MFCC
 using WAV
-using Plots
+using MFCC
+using LinearAlgebra
 # ■
 
-songname = "newworld.wav"
-source, samplerate = wavread(songname)
-source = source[:, 1]
+source, samplerate = wavread("ravel-jeux-deau.wav")
+
+channel = ceil(Int, last(size(source)) * rand())
+
+source = source[Int(samplerate) >> 2 : end, channel]
 # ■
 
-# packs in on second
+# packs in one second
 θ = 16
+
+# spacing
+τ = 1θ
+
 # samples in one pack
 δ = Int(samplerate) ÷ θ
+
 # length of packs
 ℓ = length(source) ÷ δ
 
-xs, _, _  = mfcc(source, samplerate; wintime=1/θ, steptime=1/θ)
-xs = xs'
+xs = first(mfcc(source, samplerate; wintime=1/θ, steptime=1/θ))
+xs = transpose(xs)
 
 # ■
-τ = 4θ
-distances = Dict{Tuple{Int, Int}, Float64}()
 
-for fromidx = 2τ:τ:ℓ-τ, toidx = fromidx+τ:τ:ℓ-2τ
+short = Dict{Tuple{Int, Int}, Float64}()
+large = Dict{Tuple{Int, Int}, Float64}()
+
+for fromidx = 2τ:ℓ-τ, toidx = fromidx+τ:ℓ-2τ
     X = @view xs[:, fromidx:fromidx+τ]
     Y = @view xs[:, toidx:toidx+τ]
 
-    distances[fromidx * δ, toidx * δ] = norm(X - Y)
+    if fromidx + 8τ > toidx
+        short[fromidx * δ, toidx * δ] = norm(X - Y)
+    else
+        large[fromidx * δ, toidx * δ] = norm(X - Y)
+    end
 end
-
-matches = sort(collect(zip(values(distances), keys(distances))))
 
 rm.(map(x -> "loops/" * x, split(read(`ls loops`, String))))
 
-for idx = 1:10
-    distance, (from, to) = matches[idx]
+function flesh(matches::Dict{Tuple{Int, Int}, Float64}, tag::String, quantity::Int)
+    println("[fleshing $tag]:")
+    segments = sort(collect(zip(values(matches), keys(matches))))
 
-    loop = vcat(source[to - 2τ * δ : to], source[from : from + 2τ * δ])
+    lastto = 1
+    for (distance, (from, to)) in segments
+        # moderate spacing
+        lastto + τ * δ > to && continue
+        lastto = to
 
-    wavwrite(
-        loop, "loops/$(first(split(name, '.')))-$from-$to-$(from ÷ samplerate)-$(to ÷ samplerate).wav",
-             Fs=samplerate, nbits=16, compression=WAVE_FORMAT_PCM)
+        timing = "$from-$to-$(from / samplerate)-$(to / samplerate)"
+        println(timing)
+
+        wavwrite(
+            source[from : to], "loops/$tag-$timing.wav",
+                Fs=samplerate, nbits=16, compression=WAVE_FORMAT_PCM)
+
+        quantity -= 1
+        quantity <= 0 && break
+    end
 end
 
-_, (bestfrom, bestto) = first(matches)
-
-looped = source[bestfrom : bestto]
-loop = vcat(looped, looped, looped, looped, looped)
-
-wavwrite(loop, "loops/$name-loop.wav", Fs=samplerate, nbits=16, compression=WAVE_FORMAT_PCM)
+flesh(short, "short", 12)
+flesh(large, "large", 4)
