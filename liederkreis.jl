@@ -1,196 +1,77 @@
-using FFTW
 using WAV
-using Statistics
-using Plots
-# ■
+using MFCC: mfcc
+using LinearAlgebra
+import Base.MathConstants: φ
 
-import Base.match
-using DataStructures
+# packs in one second
+const θ = 16
 
-mutable struct Vertex
-    children::Dict{UInt16, Vertex}
-    key::Union{Int, Nothing}
-    suffix::Union{Vertex, Nothing}
-    isroot::Bool
+# size of windows
+const τ = 4θ
 
-    Vertex() = new(Dict{UInt16, Vertex}(), nothing, nothing, false)
+# spacing
+const δ = θ ÷ 4
+
+const Timings = Dict{Tuple{Int, Int}, Float64}
+
+function removefiles(dir::String)
+    rm.(map(x -> "stash/" * x, split(read(`ls stash`, String))))
 end
 
-function add!(vx::Vertex, string, key::Int)
-    for char in string
-        if !haskey(vx.children, char)
-            vx.children[char] = Vertex()
-        end
+function gettimings(sourcefile::String; disk=true)
+    source, samplerate = wavread(sourcefile)
 
-        vx = vx.children[char]
-    end
+    channel = ceil(Int, last(size(source)) * rand())
+    source = source[Int(samplerate) >> 2 : end, channel]
 
-    vx.key = key
-end
+    # samples in one pack
+    β = Int(samplerate) ÷ θ
 
-function build!(root::Vertex)
-    queue = Queue{Vertex}()
-    enqueue!(queue, root)
+    # length of packs
+    ℓ = length(source) ÷ β
 
-    for vx in queue, (char, child) in vx.children
-        child.suffix = if vx.isroot
-            vx
-        else
-            search(vx.suffix, char)
-        end
+    xs = first(mfcc(source, samplerate; wintime=1/θ, steptime=1/θ))
+    xs = transpose(xs)
 
-        enqueue!(queue, child)
-    end
-end
+    timings = Timings()
 
-function search(vx::Vertex, char::UInt16)
-    if haskey(vx.children, char)
-        vx.children[char]
-    elseif vx.isroot
-        vx
-    else
-        search(vx.suffix, char)
-    end
-end
-# ■
+    for fromidx = 8θ:4:ℓ-8θ, toidx = fromidx+θ:4:ℓ-8θ
+        X = @view xs[:, fromidx:fromidx+τ]
+        Y = @view xs[:, toidx:toidx+τ]
 
-function match(source::Vector{UInt16}, markers)
-    fsm = Vertex()
-    fsm.isroot = true
-
-    duplicates = Dict{UInt64, Vector{UInt16}}()
-    marked_mapping = Dict{Vector{UInt16}, UInt64}()
-
-    for (idx, marker) in enumerate(markers)
-        if haskey(marked_mapping, marker)
-            push!(duplicates[marked_mapping[marker]], idx)
-        else
-            add!(fsm, marker, idx)
-            marked_mapping[marker] = idx
-            duplicates[idx] = []
+        if fromidx + 8θ < toidx
+            timings[fromidx * β, toidx * β] = norm(X - Y)
         end
     end
 
-    build!(fsm)
-    output = zeros(UInt64, length(markers))
+    segments = sort(collect(zip(values(timings), keys(timings))))
 
-    for (idx, char) in enumerate(source)
-        fsm = search(fsm, char)
-        vx = fsm
+    threshold = φ * first(first(segments))
+    filter!(x -> first(first(x)) < threshold, segments)
+    sort!(segments, by=x -> first(last(x)))
 
-        while true
-            if vx.key != nothing
-                output[vx.key] = idx
-            end
+    quantity = 24
+    lastfrom = 1
+    for (distance, (from, to)) in segments
+        # moderate spacing
+        abs(lastfrom - from) < 2θ * β && continue
+        lastfrom = from
 
-            vx.isroot && break
-            vx = vx.suffix
-        end
-    end
+        timing = "$from-$to-$(round(from / samplerate, digits=2))-$(round(to / samplerate, digits=2))"
+        println(timing)
 
-    for (idx, markersids) in duplicates
-        output[idx] == 0 && continue
-        for jdx in markersids
-            output[jdx] = output[idx]
-        end
-    end
+        disk && wavwrite(
+            source[from : to], "stash/$sourcefile-$timing.wav",
+                Fs=samplerate, nbits=16, compression=WAVE_FORMAT_PCM)
 
-    output
-end
-# ■
-
-sourcefn = "roll.wav"
-source, samplerate = wavread(sourcefn)
-
-# one channel is sufficient
-source = source[:, 1]
-
-# ■
-
-# packs in on second
-θ = 16
-# samples in one pack
-δ = Int(samplerate) ÷ θ
-# length of packs
-ℓ = length(source) ÷ δ
-
-maxfreqs = zeros(UInt16, ℓ)
-
-frequencies = rfftfreq(δ, samplerate)
-higherbound = findfirst(f -> f > 1000, frequencies) - 1
-
-maxenergy = 1
-
-# plot()
-
-for idx = 1:ℓ
-    transform = rfft(source[δ*(idx-1)+1:δ*idx+1])
-    freqs = real.(transform)[1:higherbound]
-
-    # plot!(frequencies[1:length(freqs)], freqs)
-
-    # how does this behave with a zero signal?
-    maxfreqs[idx] = argmax(freqs)
-    maxenergy = max(maxenergy, maximum(freqs))
-end
-
-for jdx = 1:length(maxfreqs)
-    if maxfreqs[jdx] < maxenergy / 16
-        maxfreqs[jdx] = 0
+        quantity -= 1
+        quantity <= 0 && break
     end
 end
 
-# maxfreqs[100:104]
-# plot!()
-# maxfreqs
-# ■
-
-markers = []
-
-τ = θ
-for from = 1:length(maxfreqs) - τ
-    window = maxfreqs[from:from+τ]
-    push!(markers, window)
+if !isfile(ARGS[1])
+    println("$(ARGS[1]) is a non-existent file")
+    exit(1)
 end
 
-markers
-matches = match(maxfreqs, markers)
-
-for (idx, m) in enumerate(matches)
-    if (idx + first(matches)) < m + 1
-        println(maxfreqs[idx:idx+τ-1], maxfreqs[m-τ:m-1])
-    end
-end
-
-# ■
-
-maxcorr = 0.0
-
-# how many pack to take for a 4 seconds window
-τ = 4 * θ
-bestfrom = 0
-bestto = 0
-
-for fromidx = 1:τ:ℓ-τ, toidx = fromidx+τ:ℓ-τ
-    X = @view maxfreqs[fromidx:fromidx+τ]
-    Y = @view maxfreqs[toidx:toidx+τ]
-
-    corr = cov(X, Y) / std(X) / std(Y)
-
-    if corr > maxcorr
-        maxcorr = corr
-        bestfrom = fromidx
-        bestto = toidx
-    end
-end
-
-println(maxcorr)
-maxfreqs[bestfrom:bestfrom+τ] |> println
-maxfreqs[bestto:bestto+τ] |> println
-
-looped = @view source[bestfrom * δ:bestto * δ]
-length(looped) / samplerate
-
-loop = vcat(looped, looped, looped, looped, looped)
-
-wavwrite(loop, "loop.wav", Fs=samplerate, nbits=16, compression=WAVE_FORMAT_PCM)
+gettimings(ARGS[1], disk=false)
