@@ -1,77 +1,113 @@
-using WAV
+#!/usr/bin/env julia
 using MFCC: mfcc
-using LinearAlgebra
-import Base.MathConstants: φ
+using LinearAlgebra: norm
+using DataStructures
+using Clustering
+using WAV
 
-# packs in one second
-const θ = 16
-
-# size of windows
-const τ = 4θ
-
-# spacing
-const δ = θ ÷ 4
-
-const Timings = Dict{Tuple{Int, Int}, Float64}
-
-function removefiles(dir::String)
-    rm.(map(x -> "stash/" * x, split(read(`ls stash`, String))))
+struct SeamPoint
+    startidx::Int
+    endidx::Int
+    loss::Float32
 end
 
-function gettimings(sourcefile::String; disk=true)
-    source, samplerate = wavread(sourcefile)
+import Base.isless
+isless(a::SeamPoint, b::SeamPoint) = a.loss < b.loss
 
-    channel = ceil(Int, last(size(source)) * rand())
-    source = source[Int(samplerate) >> 2 : end, channel]
+function restride(input::AbstractArray{T, 2}) where T
+    out = Vector{T}(undef, length(input))
+    m, n = size(input)
 
-    # samples in one pack
-    β = Int(samplerate) ÷ θ
+    for idx = 1:m, jdx = 1:n
+        @inbounds out[(idx-1) * n + jdx] = input[idx, jdx]
+    end
 
-    # length of packs
-    ℓ = length(source) ÷ β
+    return out
+end
 
-    xs = first(mfcc(source, samplerate; wintime=1/θ, steptime=1/θ))
-    xs = transpose(xs)
+# the number of packs per one second
+const s = 32
 
-    timings = Timings()
+# the number of MFC coefficients
+const numcep = 30
 
-    for fromidx = 8θ:4:ℓ-8θ, toidx = fromidx+θ:4:ℓ-8θ
-        X = @view xs[:, fromidx:fromidx+τ]
-        Y = @view xs[:, toidx:toidx+τ]
+# length of the pack (measured in samples)
+const τ = 1
 
-        if fromidx + 8θ < toidx
-            timings[fromidx * β, toidx * β] = norm(X - Y)
+function extract(cepstrum::Vector{Float32}, lowerbound::Int, upperbound::Int, numpacks::Int)::Vector{SeamPoint}
+    capacity = 128
+    heap = BinaryMaxHeap{SeamPoint}([SeamPoint(1, 1, Inf)])
+
+    for a = 1:numpacks - lowerbound - τ, b = a + lowerbound : min(a + upperbound - τ, numpacks - τ)
+        pack₁ = @view cepstrum[(a - 1) * numcep + 1 : (a + τ) * numcep]
+        pack₂ = @view cepstrum[(b - 1) * numcep + 1 : (b + τ) * numcep]
+
+        loss = norm(pack₁ - pack₂, 1)
+
+        if loss < top(heap).loss
+            length(heap) > capacity && pop!(heap)
+
+            push!(heap, SeamPoint(a, b, loss))
         end
     end
 
-    segments = sort(collect(zip(values(timings), keys(timings))))
+    return extract_all!(heap)
+end
 
-    threshold = φ * first(first(segments))
-    filter!(x -> first(first(x)) < threshold, segments)
-    sort!(segments, by=x -> first(last(x)))
+function main(sourcefile::String, lowerbound=10, upperbound=100, quantity=1)
+    println("reading the file")
+    source, sr = wavread(sourcefile)
+    source = source[:, 1]
 
-    quantity = 24
-    lastfrom = 1
-    for (distance, (from, to)) in segments
-        # moderate spacing
-        abs(lastfrom - from) < 2θ * β && continue
-        lastfrom = from
+    println("computing mfcc")
+    cepstrum = Float32.(first(mfcc(source, sr; wintime=1/s, steptime=1/s, numcep=numcep)))
 
-        timing = "$from-$to-$(round(from / samplerate, digits=2))-$(round(to / samplerate, digits=2))"
-        println(timing)
+    # since coefficients are strided, restride gives ~2x speedup
+    cepstrum = restride(cepstrum)
 
-        disk && wavwrite(
-            source[from : to], "stash/$sourcefile-$timing.wav",
-                Fs=samplerate, nbits=16, compression=WAVE_FORMAT_PCM)
+    # number of samples in a single pack
+    numsamples = Int(sr) ÷ s
 
-        quantity -= 1
-        quantity <= 0 && break
+    # length of the track (measured in the number of packs)
+    numpacks = length(source) ÷ numsamples
+
+    println("extracting seaming points")
+    seams = extract(cepstrum, lowerbound * s, upperbound * s, numpacks)
+
+    matrix = Array{Float32}(undef, 2, length(seams))
+
+    for idx = 1:length(seams)
+        matrix[1, idx] = seams[idx].startidx
+        matrix[2, idx] = seams[idx].endidx
+    end
+
+    println("trimming results")
+    indices = kmeans(matrix, quantity) |> assignments
+
+    sourcename = split(sourcefile, '/') |> last |> s -> split(s, '.') |> first
+
+    for idx = 1:quantity
+        seam = minimum(seams[findall(isequal(idx), indices)])
+
+        loop = source[seam.startidx * numsamples : seam.endidx * numsamples]
+
+        loopname = if quantity == 1
+            "$sourcename-loop.wav"
+        else
+            "$sourcename-loop-$idx.wav"
+        end
+
+        wavwrite(loop, loopname, Fs=sr, nbits=16, compression=WAVE_FORMAT_PCM)
     end
 end
 
-if !isfile(ARGS[1])
-    println("$(ARGS[1]) is a non-existent file")
+if length(ARGS) < 1 || length(ARGS) > 4
+    println("usage: julia liederkreis.jl <track.wav> &optional: <min-seconds> <max-seconds> <the number of loops>")
     exit(1)
 end
 
-gettimings(ARGS[1], disk=false)
+if length(ARGS) == 1
+    main(ARGS[1])
+else
+    main(ARGS[1], map(arg -> parse(Int, arg), ARGS[2:end])...)
+end
