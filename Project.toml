@@ -1,0 +1,4 @@
+[deps]
+Clustering = "aaaa29a8-35af-508c-8bc3-b662a17a0fe5"
+DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+MFCC = "ca7b5df7-6146-5dcc-89ec-36256279a339"
