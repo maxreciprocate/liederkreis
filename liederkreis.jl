@@ -3,7 +3,9 @@ using MFCC: mfcc
 using LinearAlgebra: norm
 using DataStructures
 using Clustering
+using ArgParse
 using WAV
+using Crayons
 
 struct SeamPoint
     startidx::Int
@@ -54,12 +56,45 @@ function extract(cepstrum::Vector{Float32}, lowerbound::Int, upperbound::Int, nu
     return extract_all!(heap)
 end
 
-function main(sourcefile::String, lowerbound=10, upperbound=100, quantity=1)
-    println("reading the file")
-    source, sr = wavread(sourcefile)
+function main(args)
+    rules = ArgParseSettings("Extract precise loops from the audio track")
+
+    @add_arg_table! rules begin
+        "audio-path"
+        arg_type = String
+        required = true
+        help = "path to the source audio file"
+
+        "--min-seconds", "--min"
+        nargs = '?'
+        arg_type = Int
+        default = 10
+        help = "minimum length of the loop"
+
+        "--max-seconds", "--max"
+        nargs = '?'
+        arg_type = Int
+        default = 300
+        help = "minimum length of the loop"
+
+        "--quantity", "-n"
+        nargs = '?'
+        arg_type = Int
+        default = 1
+        help = "the number of loops"
+
+        "--quiet", "-q"
+        action = :store_true
+        help = "silence the output"
+    end
+
+    settings = parse_args(args, rules)
+
+    !settings["quiet"] && println(crayon"red", "reading the file...")
+    source, sr = wavread(settings["audio-path"])
     source = source[:, 1]
 
-    println("computing mfcc")
+    !settings["quiet"] && println(crayon"yellow", "computing mfcc...")
     cepstrum = Float32.(first(mfcc(source, sr; wintime=1/s, steptime=1/s, numcep=numcep)))
 
     # since coefficients are strided, restride gives ~2x speedup
@@ -71,8 +106,8 @@ function main(sourcefile::String, lowerbound=10, upperbound=100, quantity=1)
     # length of the track (measured in the number of packs)
     numpacks = length(source) ÷ numsamples
 
-    println("extracting seaming points")
-    seams = extract(cepstrum, lowerbound * s, upperbound * s, numpacks)
+    !settings["quiet"] && println(crayon"green", "extracting seaming points...")
+    seams = extract(cepstrum, settings["min-seconds"] * s, settings["max-seconds"] * s, numpacks)
 
     matrix = Array{Float32}(undef, 2, length(seams))
 
@@ -81,33 +116,25 @@ function main(sourcefile::String, lowerbound=10, upperbound=100, quantity=1)
         matrix[2, idx] = seams[idx].endidx
     end
 
-    println("trimming results")
-    indices = kmeans(matrix, quantity) |> assignments
+    !settings["quiet"] && println(crayon"blue", "trimming results...")
+    indices = kmeans(matrix, settings["quantity"]) |> assignments
 
-    sourcename = split(sourcefile, '/') |> last |> s -> split(s, '.') |> first
+    sourcename = split(settings["audio-path"], '/') |> last |> s -> split(s, '.') |> first
 
-    for idx = 1:quantity
+    for idx = 1:settings["quantity"]
         seam = minimum(seams[findall(isequal(idx), indices)])
 
         loop = source[seam.startidx * numsamples : seam.endidx * numsamples]
 
-        loopname = if quantity == 1
+        loopname = if settings["quantity"] == 1
             "$sourcename-loop.wav"
         else
             "$sourcename-loop-$idx.wav"
         end
 
         wavwrite(loop, loopname, Fs=sr, nbits=16, compression=WAVE_FORMAT_PCM)
+        !settings["quiet"] && println(crayon"magenta", "congratulations, now run\nmpv $loopname --loop")
     end
 end
 
-if length(ARGS) < 1 || length(ARGS) > 4
-    println("usage: julia liederkreis.jl <track.wav> &optional: <min-seconds> <max-seconds> <the number of loops>")
-    exit(1)
-end
-
-if length(ARGS) == 1
-    main(ARGS[1])
-else
-    main(ARGS[1], map(arg -> parse(Int, arg), ARGS[2:end])...)
-end
+main(ARGS)
